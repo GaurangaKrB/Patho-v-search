@@ -1,0 +1,9 @@
+.venv/
+.qdrant/
+data/qdrant_storage/
+data/qdrant_storage
+data/slides_embeddings
+data/patch_embeddings
+data/*.bak.*
+__pycache__/
+=3.10.0
