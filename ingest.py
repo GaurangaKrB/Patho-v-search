@@ -1,6 +1,7 @@
 import argparse
+import logging
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -16,9 +17,14 @@ except ImportError:
     h5py = None
 
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
 DIM = 1536
 SLIDES_COLLECTION = "Slides"
 PATCHES_COLLECTION = "Patches"
+
+VALID_AGG_STRATEGIES = ("mean", "max", "cls_token", "attention_weighted")
 
 
 def stable_int_id(s: str) -> int:
@@ -49,7 +55,7 @@ def infer_slide_id(path: str) -> str:
     return os.path.splitext(base)[0]
 
 
-def list_files_with_extensions(root_dir: str, exts: Tuple[str, ...]) -> list[str]:
+def list_files_with_extensions(root_dir: str, exts: Tuple[str, ...]) -> List[str]:
     exts = tuple(e.lower() for e in exts)
     files = []
     for dirpath, _, filenames in os.walk(root_dir, followlinks=True):
@@ -221,6 +227,38 @@ def load_patch_h5(path: str) -> Tuple[str, np.ndarray, Optional[np.ndarray], Dic
     return slide_id, patch_vecs, coords, payload_template
 
 
+def aggregate_patches(patch_vecs: np.ndarray, strategy: str) -> np.ndarray:
+    """
+    Aggregate N patch vectors into a single slide-level vector.
+
+    Strategies:
+      - mean:               Simple average (baseline).
+      - max:                Element-wise max across patches.
+      - cls_token:          Use the first patch vector (index 0) as a proxy CLS token.
+      - attention_weighted: Compute per-patch L2-norm as pseudo-attention weight,
+                            apply softmax, then weighted average.
+    """
+    if strategy == "mean":
+        return patch_vecs.mean(axis=0).astype(np.float32)
+
+    if strategy == "max":
+        return patch_vecs.max(axis=0).astype(np.float32)
+
+    if strategy == "cls_token":
+        return patch_vecs[0].astype(np.float32)
+
+    if strategy == "attention_weighted":
+        # Per-patch L2 norm as pseudo importance score
+        norms = np.linalg.norm(patch_vecs, axis=1)  # (N,)
+        # Numerical stability for softmax
+        norms = norms - norms.max()
+        weights = np.exp(norms)
+        weights = weights / weights.sum()
+        return (weights[:, None] * patch_vecs).sum(axis=0).astype(np.float32)
+
+    raise ValueError(f"Unknown aggregation strategy: {strategy!r}. Valid: {VALID_AGG_STRATEGIES}")
+
+
 def ensure_collections(client: QdrantClient, recreate: bool = False, patches_on_disk: bool = True) -> None:
     existing = {c.name for c in client.get_collections().collections}
 
@@ -234,9 +272,15 @@ def ensure_collections(client: QdrantClient, recreate: bool = False, patches_on_
     def create_patches():
         client.recreate_collection(
             collection_name=PATCHES_COLLECTION,
-            vectors_config=qm.VectorParams(size=DIM, distance=qm.Distance.COSINE, on_disk=patches_on_disk),
+            vectors_config=qm.VectorParams(
+                size=DIM,
+                distance=qm.Distance.COSINE,
+                on_disk=patches_on_disk,
+            ),
+            hnsw_config=qm.HnswConfigDiff(on_disk=True),
         )
         client.create_payload_index(PATCHES_COLLECTION, "slide_id", qm.PayloadSchemaType.KEYWORD)
+        client.create_payload_index(PATCHES_COLLECTION, "label", qm.PayloadSchemaType.KEYWORD)
 
     if recreate:
         create_slides()
@@ -282,6 +326,7 @@ def ingest_patches(
     limit_files: Optional[int] = None,
     limit_patches_per_file: Optional[int] = None,
     derive_slides_from_patches: bool = True,
+    slide_agg_strategy: str = "mean",
 ) -> Tuple[int, int]:
     files = list_files_with_extensions(patches_dir, (".pt", ".h5"))
     if limit_files:
@@ -291,9 +336,16 @@ def ingest_patches(
         print(f"No patch .pt/.h5 files found in {patches_dir}")
         return 0, 0
 
+    if derive_slides_from_patches:
+        log.warning(
+            "Deriving slide vectors with '%s' pooling. "
+            "For best quality, use Prov-GigaPath's LongNet slide encoder.",
+            slide_agg_strategy,
+        )
+
     total_files = 0
     derived_slide_count = 0
-    slide_points = []
+    slide_points: List[qm.PointStruct] = []
 
     for path in tqdm(files, desc="Patch files"):
         if path.endswith(".h5"):
@@ -308,10 +360,11 @@ def ingest_patches(
             continue
 
         if derive_slides_from_patches:
-            slide_vec = patch_vecs[:n].mean(axis=0, dtype=np.float32)
+            slide_vec = aggregate_patches(patch_vecs[:n], slide_agg_strategy)
             slide_payload = dict(payload_template)
             slide_payload["slide_id"] = slide_id
             slide_payload["derived_from"] = "patch_embeddings"
+            slide_payload["agg_strategy"] = slide_agg_strategy
             slide_payload["n_patches"] = int(n)
             slide_pid = stable_int_id(f"slide:{slide_id}")
             slide_points.append(
@@ -326,13 +379,14 @@ def ingest_patches(
                 client.upsert(SLIDES_COLLECTION, points=slide_points, wait=True)
                 slide_points = []
 
+        # Batch-convert numpy slice to list-of-lists in a single C-level call
+        # instead of calling .tolist() per vector inside the loop.
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
-            batch_points = []
+            vecs_as_lists = patch_vecs[start:end].tolist()  # one C-level conversion
+            batch_points: List[qm.PointStruct] = []
 
-            for i in range(start, end):
-                vec = patch_vecs[i]
-
+            for local_idx, i in enumerate(range(start, end)):
                 pid = stable_int_id(f"patch:{slide_id}:{i}")
                 payload = dict(payload_template)
                 payload["patch_idx"] = i
@@ -341,7 +395,9 @@ def ingest_patches(
                     payload["x"] = int(coords[i, 0])
                     payload["y"] = int(coords[i, 1])
 
-                batch_points.append(qm.PointStruct(id=pid, vector=vec.tolist(), payload=payload))
+                batch_points.append(
+                    qm.PointStruct(id=pid, vector=vecs_as_lists[local_idx], payload=payload)
+                )
 
             client.upsert(PATCHES_COLLECTION, points=batch_points, wait=True)
 
@@ -357,6 +413,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qdrant_url", default=os.getenv("QDRANT_URL", "http://localhost:6333"))
     ap.add_argument("--qdrant_api_key", default=os.getenv("QDRANT_API_KEY"))
+    ap.add_argument(
+        "--qdrant_path",
+        default=os.getenv("QDRANT_PATH"),
+        help="Local folder for embedded Qdrant storage (no server needed). "
+             "If set, --qdrant_url is ignored. Env: QDRANT_PATH",
+    )
     ap.add_argument("--slides_dir", default="data/slides_embeddings")
     ap.add_argument("--patches_dir", default="data/patch_embeddings")
     ap.add_argument("--recreate", action="store_true")
@@ -367,6 +429,13 @@ def main():
     ap.add_argument("--limit_patches_per_file", type=int, default=None)
     ap.add_argument("--disable_derive_slides_from_patches", action="store_true")
     ap.add_argument(
+        "--slide_agg_strategy",
+        choices=VALID_AGG_STRATEGIES,
+        default="mean",
+        help="Strategy for deriving slide vectors from patch embeddings. "
+             "Choices: mean, max, cls_token, attention_weighted. Default: mean.",
+    )
+    ap.add_argument(
         "--patches-on-disk",
         dest="patches_on_disk",
         action=argparse.BooleanOptionalAction,
@@ -375,11 +444,14 @@ def main():
 
     args = ap.parse_args()
 
-    qdrant_client_kwargs = {"url": args.qdrant_url}
-    if args.qdrant_api_key:
-        qdrant_client_kwargs["api_key"] = args.qdrant_api_key
-
-    client = QdrantClient(**qdrant_client_kwargs)
+    if args.qdrant_path:
+        log.info("Using local embedded Qdrant at: %s", args.qdrant_path)
+        client = QdrantClient(path=args.qdrant_path)
+    else:
+        qdrant_client_kwargs = {"url": args.qdrant_url}
+        if args.qdrant_api_key:
+            qdrant_client_kwargs["api_key"] = args.qdrant_api_key
+        client = QdrantClient(**qdrant_client_kwargs)
     ensure_collections(client, recreate=args.recreate, patches_on_disk=args.patches_on_disk)
 
     n_slides = ingest_slides(client, args.slides_dir, limit=args.limit_slides)
@@ -391,6 +463,7 @@ def main():
         limit_files=args.limit_patch_files,
         limit_patches_per_file=args.limit_patches_per_file,
         derive_slides_from_patches=derive_slides_from_patches,
+        slide_agg_strategy=args.slide_agg_strategy,
     )
 
     print(

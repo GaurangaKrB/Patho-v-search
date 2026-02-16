@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import xxhash
 from fastapi import FastAPI, HTTPException
@@ -11,6 +11,7 @@ from qdrant_client.http import models as qm
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_PATH = os.getenv("QDRANT_PATH")  # local folder for embedded Qdrant (no server)
 SLIDES_COLLECTION = "Slides"
 PATCHES_COLLECTION = "Patches"
 
@@ -19,11 +20,14 @@ def stable_int_id(s: str) -> int:
     return xxhash.xxh64(s).intdigest() & 0x7FFFFFFFFFFFFFFF
 
 
-qdrant_client_kwargs = {"url": QDRANT_URL}
-if QDRANT_API_KEY:
-    qdrant_client_kwargs["api_key"] = QDRANT_API_KEY
+if QDRANT_PATH:
+    client = QdrantClient(path=QDRANT_PATH)
+else:
+    qdrant_client_kwargs = {"url": QDRANT_URL}
+    if QDRANT_API_KEY:
+        qdrant_client_kwargs["api_key"] = QDRANT_API_KEY
+    client = QdrantClient(**qdrant_client_kwargs)
 
-client = QdrantClient(**qdrant_client_kwargs)
 app = FastAPI(title="Patho-v-search Backend", version="0.1.0")
 
 
@@ -36,6 +40,14 @@ class PatchSearchRequest(BaseModel):
     slide_id: str
     patch_idx: int = Field(default=0, ge=0)
     top_k: int = Field(default=50, ge=1, le=500)
+    exclude_same_slide: bool = Field(
+        default=True,
+        description="If True, exclude patches from the same WSI as the query patch.",
+    )
+    filter_label: Optional[str] = Field(
+        default=None,
+        description="If set, only return patches whose 'label' payload matches this value.",
+    )
 
 
 def get_slide_vector(slide_id: str) -> List[float]:
@@ -74,7 +86,7 @@ def vector_search(
     collection_name: str,
     query_vector: List[float],
     limit: int,
-    query_filter: qm.Filter | None = None,
+    query_filter: Optional[qm.Filter] = None,
 ):
     # qdrant-client >=1.10 uses query_points; older versions expose search.
     if hasattr(client, "query_points"):
@@ -154,10 +166,32 @@ def search_similar_slides(req: SlideSearchRequest) -> Dict[str, Any]:
 def search_similar_patches(req: PatchSearchRequest) -> Dict[str, Any]:
     query_vec = get_patch_vector(req.slide_id, req.patch_idx)
 
+    # Build filter: exclude same slide, optionally require specific label
+    must_not_conditions = []
+    must_conditions = []
+
+    if req.exclude_same_slide:
+        must_not_conditions.append(
+            qm.FieldCondition(key="slide_id", match=qm.MatchValue(value=req.slide_id))
+        )
+
+    if req.filter_label is not None:
+        must_conditions.append(
+            qm.FieldCondition(key="label", match=qm.MatchValue(value=req.filter_label))
+        )
+
+    query_filter = None
+    if must_not_conditions or must_conditions:
+        query_filter = qm.Filter(
+            must=must_conditions if must_conditions else None,
+            must_not=must_not_conditions if must_not_conditions else None,
+        )
+
     hits = vector_search(
         collection_name=PATCHES_COLLECTION,
         query_vector=query_vec,
         limit=req.top_k,
+        query_filter=query_filter,
     )
 
     results = []
@@ -176,5 +210,9 @@ def search_similar_patches(req: PatchSearchRequest) -> Dict[str, Any]:
 
     return {
         "query": {"slide_id": req.slide_id, "patch_idx": req.patch_idx},
+        "filters_applied": {
+            "exclude_same_slide": req.exclude_same_slide,
+            "filter_label": req.filter_label,
+        },
         "results": results,
     }
