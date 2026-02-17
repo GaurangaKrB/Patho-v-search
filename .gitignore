@@ -1,10 +1,13 @@
 .venv/
 .qdrant/
+.gemini/
 data/qdrant_storage/
 data/qdrant_storage
 data/qdrant_local/
 data/empty_slides/
 data/slides_embeddings
 data/patch_embeddings
+data/panda_real/
+data/*.zip
 data/*.bak.*
 __pycache__/

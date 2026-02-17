@@ -218,6 +218,24 @@ def load_patch_h5(path: str) -> Tuple[str, np.ndarray, Optional[np.ndarray], Dic
                 coords = np.asarray(f[ck]).astype(np.int32)
                 break
 
+        # Read metadata from HDF5 attributes (e.g. diagnosis, label, provider)
+        for attr_key in ("diagnosis", "label", "patient_id", "provider",
+                         "isup_grade", "dataset"):
+            if attr_key in f.attrs:
+                val = f.attrs[attr_key]
+                # h5py may return bytes; decode to str
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8")
+                # numpy scalars aren't JSON-serializable; cast to Python native
+                elif isinstance(val, (np.integer,)):
+                    val = int(val)
+                elif isinstance(val, (np.floating,)):
+                    val = float(val)
+                payload_template[attr_key] = val
+        # Also propagate diagnosis → label if label is missing
+        if "label" not in payload_template and "diagnosis" in payload_template:
+            payload_template["label"] = payload_template["diagnosis"]
+
     if patch_vecs.shape[1] != DIM:
         raise ValueError(f"Patch dim mismatch in {path}: got {patch_vecs.shape[1]}, expected {DIM}")
 
