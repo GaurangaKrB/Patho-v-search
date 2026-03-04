@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Qdrant local storage
+data/qdrant_local/
+
+# Downloaded data (large files — not tracked)
+data/panda_real/
+data/patch_metadata.json
+data/empty_slides/
+data/patch_embeddings/
+data/slides_embeddings/
+brca/
+
+# Logs
+data/*.log
+data/*.out
+
+# IDE / editor
+.gemini/
+.qdrant/
